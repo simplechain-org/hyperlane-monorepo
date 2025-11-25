@@ -224,6 +224,7 @@ export class WarpCore {
     senderPubKey,
     interchainFee,
     tokenFeeQuote,
+    amount,
   }: {
     originToken: IToken;
     destination: ChainNameOrId;
@@ -231,6 +232,7 @@ export class WarpCore {
     senderPubKey?: HexString;
     interchainFee?: TokenAmount;
     tokenFeeQuote?: TokenAmount;
+    amount?: Numberish;
   }): Promise<TransactionFeeEstimate> {
     this.logger.debug(`Estimating local transfer gas to ${destination}`);
     const originMetadata = this.multiProvider.getChainMetadata(
@@ -256,7 +258,7 @@ export class WarpCore {
       destinationMetadata.bech32Prefix,
     );
     const txs = await this.getTransferRemoteTxs({
-      originTokenAmount: originToken.amount(2),
+      originTokenAmount: originToken.amount(amount ?? 2),
       destination,
       sender,
       recipient,
@@ -313,20 +315,21 @@ export class WarpCore {
    * @todo: rename to getLocalTransferFee for consistency (requires breaking change)
    */
   async getLocalTransferFeeAmount({
-    originToken,
+    originTokenAmount,
     destination,
     sender,
     senderPubKey,
     interchainFee,
     tokenFeeQuote,
   }: {
-    originToken: IToken;
+    originTokenAmount: TokenAmount;
     destination: ChainNameOrId;
     sender: Address;
     senderPubKey?: HexString;
     interchainFee?: TokenAmount;
     tokenFeeQuote?: TokenAmount;
   }): Promise<TokenAmount> {
+    const { token: originToken, amount } = originTokenAmount;
     const originMetadata = this.multiProvider.getChainMetadata(
       originToken.chainName,
     );
@@ -345,6 +348,7 @@ export class WarpCore {
       senderPubKey,
       interchainFee,
       tokenFeeQuote,
+      amount,
     });
 
     // Get the local gas token. This assumes the chain's native token will pay for local gas
@@ -539,7 +543,7 @@ export class WarpCore {
 
     // Next, get the local gas quote
     const localQuote = await this.getLocalTransferFeeAmount({
-      originToken: originTokenAmount.token,
+      originTokenAmount,
       destination,
       sender,
       senderPubKey,
@@ -935,7 +939,7 @@ export class WarpCore {
 
     // Check 4: Simulates the transfer by getting the local gas fee
     const localQuote = await this.getLocalTransferFeeAmount({
-      originToken,
+      originTokenAmount,
       destination,
       sender,
       senderPubKey,
