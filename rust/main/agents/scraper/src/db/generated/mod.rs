@@ -8,4 +8,6 @@ pub mod delivered_message;
 pub mod domain;
 pub mod gas_payment;
 pub mod message;
+pub mod message_view;
 pub mod transaction;
+pub mod warp_route;

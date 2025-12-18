@@ -13,6 +13,7 @@ mod m20230309_000003_create_table_transaction;
 mod m20230309_000004_create_table_delivered_message;
 mod m20230309_000004_create_table_gas_payment;
 mod m20230309_000005_create_table_message;
+mod m20230309_000006_create_table_warp_route;
 
 pub struct Migrator;
 
@@ -30,6 +31,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20230309_000004_create_table_gas_payment::Migration),
             Box::new(m20230309_000004_create_table_delivered_message::Migration),
             Box::new(m20230309_000005_create_table_message::Migration),
+            Box::new(m20230309_000006_create_table_warp_route::Migration),
         ]
     }
 }

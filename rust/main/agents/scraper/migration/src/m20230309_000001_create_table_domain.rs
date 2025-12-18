@@ -352,6 +352,14 @@ const DOMAINS: &[RawDomain] = &[
         is_deprecated: false,
     },
     RawDomain {
+        name: "simplechain",
+        token: "SRW",
+        domain: 1914,
+        chain_id: 1914,
+        is_test_net: true,
+        is_deprecated: false,
+    },
+    RawDomain {
         name: "solanamainnet",
         token: "SOL",
         domain: 1399811149,

@@ -20,6 +20,8 @@ use eyre::Result;
 use hyperlane_base::agent_main;
 
 mod agent;
+/// API interface module
+pub mod api;
 mod conversions;
 mod date_time;
 mod db;

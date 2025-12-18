@@ -16,7 +16,7 @@ use hyperlane_base::{
     CoreMetrics, HyperlaneAgentCore, RuntimeMetrics, SyncOptions,
 };
 
-use crate::{db::ScraperDb, settings::ScraperSettings, store::HyperlaneDbStore};
+use crate::{api::create_api_router, db::ScraperDb, settings::ScraperSettings, store::HyperlaneDbStore};
 
 const CURSOR_INSTANTIATION_ATTEMPTS: usize = 10;
 
@@ -33,6 +33,8 @@ pub struct Scraper {
     agent_metrics: AgentMetrics,
     chain_metrics: ChainMetrics,
     runtime_metrics: RuntimeMetrics,
+    /// Database connection for API queries
+    db: ScraperDb,
 }
 
 #[derive(Debug)]
@@ -80,6 +82,7 @@ impl BaseAgent for Scraper {
             agent_metrics,
             chain_metrics,
             runtime_metrics,
+            db,
         })
     }
 
@@ -87,7 +90,10 @@ impl BaseAgent for Scraper {
     async fn run(self) {
         let mut tasks = Vec::with_capacity(self.scrapers.len());
 
-        // running http server
+        // Create custom API routes (crosschain history query interface)
+        let api_router = create_api_router(self.db.clone());
+
+        // running http server with custom API routes
         let server = self
             .core
             .settings
@@ -95,7 +101,7 @@ impl BaseAgent for Scraper {
             .expect("Failed to create server");
         let server_task = tokio::spawn(
             async move {
-                server.run();
+                server.run_with_custom_router(api_router);
             }
             .instrument(info_span!("Scraper server")),
         );

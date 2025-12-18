@@ -3,8 +3,10 @@
 use eyre::Result;
 use itertools::Itertools;
 use sea_orm::{
-    prelude::*, ActiveValue::*, DeriveColumn, EnumIter, Insert, QuerySelect, TransactionTrait,
+    prelude::*, ActiveValue::*, Condition, DeriveColumn, EnumIter, Insert, QueryOrder, QuerySelect,
+    TransactionTrait,
 };
+use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, trace};
 
 use hyperlane_core::{
@@ -15,7 +17,104 @@ use migration::OnConflict;
 use crate::date_time;
 use crate::db::ScraperDb;
 
-use super::generated::{delivered_message, message};
+use super::generated::{delivered_message, message, message_view, warp_route};
+
+/// Token information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenInfo {
+    /// Token name
+    pub name: String,
+    /// Token symbol
+    pub symbol: String,
+    /// Token decimals
+    pub decimals: u16,
+}
+
+/// Cross-chain transaction status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CrossChainStatus {
+    /// Sent, waiting for delivery
+    Pending,
+    /// Successfully delivered
+    Delivered,
+}
+
+/// Cross-chain history record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrossChainHistory {
+    /// Message ID
+    pub msg_id: String,
+    /// Message nonce
+    pub nonce: u32,
+    
+    /// Origin domain ID
+    pub origin_domain_id: u32,
+    /// Origin chain ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_chain_id: Option<u64>,
+    /// Origin domain name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_domain: Option<String>,
+    
+    /// Destination domain ID
+    pub destination_domain_id: u32,
+    /// Destination chain ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination_chain_id: Option<u64>,
+    /// Destination domain name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination_domain: Option<String>,
+    
+    /// Sender address
+    pub sender: String,
+    /// Recipient address
+    pub recipient: String,
+    
+    /// Cross-chain transaction status
+    pub status: CrossChainStatus,
+    /// Whether delivered
+    pub is_delivered: bool,
+    
+    /// Send time (block time)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub send_time: Option<String>,
+    /// Delivery time (block time)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_time: Option<String>,
+    
+    /// Origin chain transaction hash
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_tx_hash: Option<String>,
+    /// Destination chain transaction hash
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination_tx_hash: Option<String>,
+    
+    /// Origin chain block height
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_block_height: Option<i64>,
+    /// Destination chain block height
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination_block_height: Option<i64>,
+    
+    /// Token information (if matched with warp route)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_info: Option<TokenInfo>,
+}
+
+/// Paginated query result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaginatedResult<T> {
+    /// Data list
+    pub data: Vec<T>,
+    /// Total count
+    pub total: u64,
+    /// Current page number
+    pub page: u64,
+    /// Page size
+    pub page_size: u64,
+    /// Total pages
+    pub total_pages: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct StorableDelivery<'a> {
@@ -358,6 +457,211 @@ impl ScraperDb {
             "Wrote new messages to database"
         );
         Ok(new_dispatch_count)
+    }
+
+    /// Query cross-chain history records by user address (with pagination)
+    /// Use message_view view to get complete cross-chain transaction information
+    /// 
+    /// # Parameters
+    /// - `user_address`: User address (transaction sender address)
+    /// - `page`: Page number (starting from 1)
+    /// - `page_size`: Page size
+    /// 
+    /// # Returns
+    /// Paginated cross-chain history records, including send time, delivery time, transaction hashes and other complete information
+    #[instrument(skip(self))]
+    pub async fn query_cross_chain_history_by_address(
+        &self,
+        user_address: &H256,
+        page: u64,
+        page_size: u64,
+    ) -> Result<PaginatedResult<CrossChainHistory>> {
+        // The database stores 20-byte EVM addresses, need to extract the last 20 bytes
+        let address_bytes_20 = extract_evm_address(&address_to_bytes(user_address));
+
+        // Query total count from message_view view
+        // Match with origin_tx_sender (transaction sender), which is the actual user address initiating the cross-chain transaction
+        // The sender field is contract address, not user address
+        let total = message_view::Entity::find()
+            .filter(message_view::Column::OriginTxSender.eq(address_bytes_20.clone()))
+            .count(&self.0)
+            .await?;
+
+        // Calculate offset
+        let offset = (page.saturating_sub(1)).saturating_mul(page_size);
+
+        // Query message list from message_view view (ordered by send time descending)
+        let messages = message_view::Entity::find()
+            .filter(message_view::Column::OriginTxSender.eq(address_bytes_20.clone()))
+            .order_by_desc(message_view::Column::SendOccurredAt)
+            .offset(offset)
+            .limit(page_size)
+            .all(&self.0)
+            .await?;
+
+        // Collect all address pairs that need to be queried (origin + sender, destination + recipient)
+        let mut address_pairs: Vec<(i32, Vec<u8>, i32, Vec<u8>)> = Vec::new();
+        for msg in &messages {
+            address_pairs.push((
+                msg.origin_domain_id,
+                msg.sender.clone(),
+                msg.destination_domain_id,
+                msg.recipient.clone(),
+            ));
+        }
+
+        // Batch query warp routes
+        let warp_routes = self.query_warp_routes_batch(&address_pairs).await?;
+
+        // Convert to cross-chain history records
+        let data: Vec<CrossChainHistory> = messages
+            .into_iter()
+            .map(|msg| {
+                // Find matching warp route token information
+                // Note: Addresses in msg are 32 bytes, addresses in warp_route are 20 bytes
+                let sender_20 = extract_evm_address(&msg.sender);
+                let recipient_20 = extract_evm_address(&msg.recipient);
+                
+                let token_info = warp_routes
+                    .iter()
+                    .find(|route| {
+                        // Match src_chain + sender or dst_chain + recipient
+                        (route.src_chain_id == msg.origin_domain_id as i64
+                            && route.src_chain_address == sender_20)
+                            || (route.dst_chain_id == msg.destination_domain_id as i64
+                                && route.dst_chain_address == recipient_20)
+                            || (route.src_chain_id == msg.origin_domain_id as i64
+                                && route.src_chain_address == recipient_20)
+                            || (route.dst_chain_id == msg.destination_domain_id as i64
+                                && route.dst_chain_address == sender_20)
+                    })
+                    .map(|route| TokenInfo {
+                        name: route.token_name.clone(),
+                        symbol: route.token_symbol.clone(),
+                        decimals: route.token_decimals as u16,
+                    });
+
+                // Determine cross-chain transaction status
+                let status = if msg.is_delivered {
+                    CrossChainStatus::Delivered
+                } else {
+                    CrossChainStatus::Pending
+                };
+
+                CrossChainHistory {
+                    msg_id: format!("0x{}", hex::encode(&msg.msg_id)),
+                    nonce: msg.nonce as u32,
+                    
+                    origin_domain_id: msg.origin_domain_id as u32,
+                    origin_chain_id: msg.origin_chain_id.map(|id| id as u64),
+                    origin_domain: msg.origin_domain.clone(),
+                    
+                    destination_domain_id: msg.destination_domain_id as u32,
+                    destination_chain_id: msg.destination_chain_id.map(|id| id as u64),
+                    destination_domain: msg.destination_domain.clone(),
+                    
+                    sender: format!("0x{}", hex::encode(&msg.sender)),
+                    recipient: format!("0x{}", hex::encode(&msg.recipient)),
+                    
+                    status,
+                    is_delivered: msg.is_delivered,
+                    
+                    // Send time (block time)
+                    send_time: msg.send_occurred_at.map(|t| t.to_string()),
+                    // Delivery time (block time)
+                    delivery_time: msg.delivery_occurred_at.map(|t| t.to_string()),
+                    
+                    // Origin chain transaction hash
+                    origin_tx_hash: msg.origin_tx_hash.as_ref().map(|h| format!("0x{}", hex::encode(h))),
+                    // Destination chain transaction hash
+                    destination_tx_hash: msg.destination_tx_hash.as_ref().map(|h| format!("0x{}", hex::encode(h))),
+                    
+                    // Block height
+                    origin_block_height: msg.origin_block_height,
+                    destination_block_height: msg.destination_block_height,
+                    
+                    token_info,
+                }
+            })
+            .collect();
+
+        // Calculate total pages
+        let total_pages = if total == 0 {
+            0
+        } else {
+            total.saturating_add(page_size.saturating_sub(1)) / page_size
+        };
+
+        Ok(PaginatedResult {
+            data,
+            total,
+            page,
+            page_size,
+            total_pages,
+        })
+    }
+
+    /// Batch query warp routes
+    /// Query matching warp route information based on address pairs
+    /// Note: Addresses in message table are 32 bytes (H256), addresses in warp_route table are 20 bytes (EVM addresses)
+    /// Need to extract the last 20 bytes of 32-byte addresses for matching
+    #[instrument(skip(self, address_pairs))]
+    async fn query_warp_routes_batch(
+        &self,
+        address_pairs: &[(i32, Vec<u8>, i32, Vec<u8>)],
+    ) -> Result<Vec<warp_route::Model>> {
+        if address_pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Collect all unique (chain_id, address) pairs
+        // Convert 32-byte addresses to 20-byte EVM addresses (extract last 20 bytes)
+        let mut chain_addresses: Vec<(i64, Vec<u8>)> = Vec::new();
+        for (origin, sender, destination, recipient) in address_pairs {
+            let sender_20 = extract_evm_address(sender);
+            let recipient_20 = extract_evm_address(recipient);
+            chain_addresses.push((*origin as i64, sender_20));
+            chain_addresses.push((*destination as i64, recipient_20));
+        }
+
+        // Deduplicate
+        chain_addresses.sort();
+        chain_addresses.dedup();
+
+        // Build query conditions
+        let mut condition = Condition::any();
+        for (chain_id, address) in &chain_addresses {
+            condition = condition.add(
+                Condition::all()
+                    .add(warp_route::Column::SrcChainId.eq(*chain_id))
+                    .add(warp_route::Column::SrcChainAddress.eq(address.clone())),
+            );
+            condition = condition.add(
+                Condition::all()
+                    .add(warp_route::Column::DstChainId.eq(*chain_id))
+                    .add(warp_route::Column::DstChainAddress.eq(address.clone())),
+            );
+        }
+
+        // Query enabled warp routes
+        let routes = warp_route::Entity::find()
+            .filter(condition)
+            .filter(warp_route::Column::IsEnabled.eq(true))
+            .all(&self.0)
+            .await?;
+
+        Ok(routes)
+    }
+}
+
+/// Extract 20-byte EVM address from 32-byte address (extract last 20 bytes)
+fn extract_evm_address(address: &[u8]) -> Vec<u8> {
+    if address.len() >= 20 {
+        // Take last 20 bytes (H256 format addresses, first 12 bytes are zero padding)
+        address[address.len() - 20..].to_vec()
+    } else {
+        // If address length is insufficient, return directly
+        address.to_vec()
     }
 }
 

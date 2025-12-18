@@ -7,6 +7,9 @@ use sea_orm::{Database, DatabaseConnection, DbConn};
 use tracing::instrument;
 pub use txn::*;
 
+// Re-export cross-chain history related types
+pub use message::{CrossChainHistory, CrossChainStatus, PaginatedResult, TokenInfo};
+
 #[allow(clippy::all)]
 mod generated;
 
